@@ -17,6 +17,7 @@
 ****************************************************************/
 #include <stddef.h>               /* size_t */
 #include "../common/zstd_deps.h"  /* ZSTD_memcpy, ZSTD_memset */
+#include "../common/bmi2.h"
 #include "../common/compiler.h"
 #include "../common/bitstream.h"  /* BIT_* */
 #include "../common/fse.h"        /* to compress headers */
@@ -117,9 +118,10 @@ typedef size_t (*HUF_DecompressUsingDTableFn)(void *dst, size_t dstSize,
     static size_t fn(void* dst, size_t dstSize, void const* cSrc,           \
                      size_t cSrcSize, HUF_DTable const* DTable, int flags)  \
     {                                                                       \
-        if (flags & HUF_flags_bmi2) {                                       \
+        if (ZSTD_USE_BMI2(flags & HUF_flags_bmi2)) {                        \
             return fn##_bmi2(dst, dstSize, cSrc, cSrcSize, DTable);         \
         }                                                                   \
+        (void)flags;                                                        \
         return fn##_default(dst, dstSize, cSrc, cSrcSize, DTable);          \
     }
 
@@ -284,12 +286,13 @@ static size_t HUF_initRemainingDStream(BIT_DStream_t* bit, HUF_DecompressFastArg
     /* Validate that we haven't overwritten. */
     if (args->op[stream] > segmentEnd)
         return ERROR(corruption_detected);
-    /* Validate that we haven't read beyond iend[].
-        * Note that ip[] may be < iend[] because the MSB is
-        * the next bit to read, and we may have consumed 100%
-        * of the stream, so down to iend[i] - 8 is valid.
-        */
-    if (args->ip[stream] < args->iend[stream] - 8)
+    /* The MSB is the next bit to read, so ip[] may be up to 8 bytes before
+     * iend[] when the stream is fully consumed. Compare distances rather than
+     * forming iend[0] - 8, which can be before the compressed input.
+     * No loaded word may precede ilowest. */
+    if (args->ip[stream] < args->ilowest
+        || (args->ip[stream] < args->iend[stream]
+            && (size_t)(args->iend[stream] - args->ip[stream]) > 8))
         return ERROR(corruption_detected);
 
     /* Construct the BIT_DStream_t. */
@@ -704,6 +707,8 @@ size_t HUF_decompress4X1_usingDTable_internal_bmi2(void* dst, size_t dstSize, vo
                     size_t cSrcSize, HUF_DTable const* DTable) {
     return HUF_decompress4X1_usingDTable_internal_body(dst, dstSize, cSrc, cSrcSize, DTable);
 }
+#else
+#define HUF_decompress4X1_usingDTable_internal_bmi2 HUF_decompress4X1_usingDTable_internal_default
 #endif
 
 static
@@ -901,18 +906,16 @@ static size_t HUF_decompress4X1_usingDTable_internal(void* dst, size_t dstSize, 
     HUF_DecompressUsingDTableFn fallbackFn = HUF_decompress4X1_usingDTable_internal_default;
     HUF_DecompressFastLoopFn loopFn = HUF_decompress4X1_usingDTable_internal_fast_c_loop;
 
-#if DYNAMIC_BMI2
-    if (flags & HUF_flags_bmi2) {
+    if (ZSTD_USE_BMI2(flags & HUF_flags_bmi2)) {
         fallbackFn = HUF_decompress4X1_usingDTable_internal_bmi2;
 # if ZSTD_ENABLE_ASM_X86_64_BMI2
         if (!(flags & HUF_flags_disableAsm)) {
             loopFn = HUF_decompress4X1_usingDTable_internal_fast_asm_loop;
         }
 # endif
-    } else {
+    } else if (DYNAMIC_BMI2) {
         return fallbackFn(dst, dstSize, cSrc, cSrcSize, DTable);
     }
-#endif
 
 #if ZSTD_ENABLE_ASM_X86_64_BMI2 && defined(__BMI2__)
     if (!(flags & HUF_flags_disableAsm)) {
@@ -1315,7 +1318,9 @@ HUF_decodeStreamX2(BYTE* p, BIT_DStream_t* bitDPtr, BYTE* const pEnd,
     if ((size_t)(pEnd - p) >= sizeof(bitDPtr->bitContainer)) {
         if (dtLog <= 11 && MEM_64bits()) {
             /* up to 10 symbols at a time */
-            while ((BIT_reloadDStream(bitDPtr) == BIT_DStream_unfinished) & (p < pEnd-9)) {
+            /* For an 8-byte output, pEnd - 9 would precede the buffer. */
+            BYTE* const pLimit = (size_t)(pEnd - p) >= 10 ? pEnd - 9 : p;
+            while ((BIT_reloadDStream(bitDPtr) == BIT_DStream_unfinished) & (p < pLimit)) {
                 HUF_DECODE_SYMBOLX2_0(p, bitDPtr);
                 HUF_DECODE_SYMBOLX2_0(p, bitDPtr);
                 HUF_DECODE_SYMBOLX2_0(p, bitDPtr);
@@ -1507,6 +1512,8 @@ size_t HUF_decompress4X2_usingDTable_internal_bmi2(void* dst, size_t dstSize, vo
                     size_t cSrcSize, HUF_DTable const* DTable) {
     return HUF_decompress4X2_usingDTable_internal_body(dst, dstSize, cSrc, cSrcSize, DTable);
 }
+#else
+#define HUF_decompress4X2_usingDTable_internal_bmi2 HUF_decompress4X2_usingDTable_internal_default
 #endif
 
 static
@@ -1731,18 +1738,16 @@ static size_t HUF_decompress4X2_usingDTable_internal(void* dst, size_t dstSize, 
     HUF_DecompressUsingDTableFn fallbackFn = HUF_decompress4X2_usingDTable_internal_default;
     HUF_DecompressFastLoopFn loopFn = HUF_decompress4X2_usingDTable_internal_fast_c_loop;
 
-#if DYNAMIC_BMI2
-    if (flags & HUF_flags_bmi2) {
+    if (ZSTD_USE_BMI2(flags & HUF_flags_bmi2)) {
         fallbackFn = HUF_decompress4X2_usingDTable_internal_bmi2;
 # if ZSTD_ENABLE_ASM_X86_64_BMI2
         if (!(flags & HUF_flags_disableAsm)) {
             loopFn = HUF_decompress4X2_usingDTable_internal_fast_asm_loop;
         }
 # endif
-    } else {
+    } else if (DYNAMIC_BMI2) {
         return fallbackFn(dst, dstSize, cSrc, cSrcSize, DTable);
     }
-#endif
 
 #if ZSTD_ENABLE_ASM_X86_64_BMI2 && defined(__BMI2__)
     if (!(flags & HUF_flags_disableAsm)) {
